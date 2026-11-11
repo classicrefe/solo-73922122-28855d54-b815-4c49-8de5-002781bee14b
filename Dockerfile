@@ -11,6 +11,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY tools ./tools
+
+# 固定本地目录：logs 放 deny.log 及轮转文件，data 放 SQLite 与采集锁
+RUN mkdir -p /var/lib/firewall-deny/logs /var/lib/firewall-deny/data
 
 EXPOSE 8000
 

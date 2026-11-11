@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .collector.routes import get_collect_page, router as deny_router
 from .engine import ValidationFailure, analyze
 from .example_data import EXAMPLE_PAYLOAD
 
@@ -16,9 +17,9 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
-    title="防火墙规则变更差分台",
-    description="精确比对两份有序 IPv4/TCP 规则集，输出新增放行与新增阻断的全部区域。",
-    version="1.0.0",
+    title="防火墙运维台",
+    description="规则变更精确差分 + deny.log 被拒连接采集排查。",
+    version="2.0.0",
 )
 
 
@@ -32,7 +33,13 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/deny", include_in_schema=False)
+def deny_collect_page() -> FileResponse:
+    return get_collect_page()
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(deny_router)
 
 
 @app.get("/api/example")

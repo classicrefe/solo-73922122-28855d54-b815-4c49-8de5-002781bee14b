@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>阻断连接采集 · deny.log 排查</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #273449; --line: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+    --deny: #dc2626; --deny-bg: #2a0a0a;
+    --warn: #f59e0b; --err-bg: #3f1414; --err-line: #b91c1c;
+    --ok: #16a34a; --ok-bg: #052e16;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 20px 28px 12px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 6px; font-size: 20px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  header a { color: var(--accent); text-decoration: none; }
+  main { padding: 20px 28px 60px; max-width: 1400px; margin: 0 auto; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: #0369a1; border-color: #0ea5e9; color: #fff; }
+  button.primary:hover { background: #0284c7; color: #fff; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 15px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .muted { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  code { color: #bae6fd; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; white-space: nowrap; }
+  .badge.ok { background: var(--ok-bg); color: #4ade80; border: 1px solid var(--ok); }
+  .badge.err { background: var(--err-bg); color: #f87171; border: 1px solid var(--err-line); }
+  .badge.wait { background: #1f2937; color: #fbbf24; border: 1px solid var(--warn); }
+  #errors-panel { display: none; border-color: var(--err-line); background: var(--err-bg); }
+  #errors-panel.show { display: block; }
+  #errors-panel h2 { color: #fca5a5; }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+  .filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .filters input {
+    background: #0b1220; border: 1px solid var(--line); border-radius: 6px;
+    color: #dbeafe; padding: 7px 10px; font-size: 13px; min-width: 160px;
+  }
+  .pager { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+  .empty { color: var(--muted); font-style: italic; padding: 10px 2px; }
+  .progress-bar { height: 6px; background: #0b1220; border-radius: 999px; overflow: hidden; min-width: 120px; }
+  .progress-bar > span { display: block; height: 100%; background: var(--accent); }
+  #toast { position: fixed; right: 24px; bottom: 24px; max-width: 460px; display: none;
+           background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; }
+  #toast.show { display: block; }
+  #toast.err { border-color: var(--err-line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>阻断连接采集（deny.log JSONL · 字节级续采）</h1>
+  <p>从固定本地目录读取 <code>deny.log</code> 及其数字后缀轮转文件，按文件身份
+     （设备号 + inode）记录字节进度；每条被拒连接与进度同事务提交，中断重启、双进程并发均不漏不重。</p>
+  <p><a href="/">← 返回规则变更差分台</a></p>
+</header>
+
+<main>
+  <div class="toolbar">
+    <button class="primary" id="btn-collect" type="button">立即采集</button>
+    <button id="btn-refresh" type="button">刷新状态</button>
+    <button id="btn-clear-errors" type="button">清除坏行标记</button>
+    <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:12.5px">
+      <input type="checkbox" id="auto-refresh"> 每 5 秒自动刷新
+    </label>
+  </div>
+
+  <section class="card" id="status-card">
+    <h2>采集状态</h2>
+    <div id="status-body"><span class="empty">加载中…</span></div>
+  </section>
+
+  <section class="card" id="errors-panel">
+    <h2>坏行（命中坏行的文件已停止采集，修复后清除标记可继续）</h2>
+    <div id="errors-body"></div>
+  </section>
+
+  <section class="card">
+    <h2>被拒连接（分页）</h2>
+    <form class="filters" id="filter-form">
+      <label>命中规则 ID <input name="rule_id" placeholder="如 FW-DENY-101"></label>
+      <label>源 IPv4 <input name="src_ip" placeholder="如 10.0.0.5"></label>
+      <label>目的 IPv4 <input name="dst_ip" placeholder="如 192.168.10.20"></label>
+      <button type="submit" class="primary">查询</button>
+      <button type="button" id="btn-reset">重置</button>
+      <label>每页
+        <select name="page_size" id="page-size" style="background:#0b1220;color:#dbeafe;border:1px solid var(--line);border-radius:6px;padding:7px 10px">
+          <option>10</option><option selected>20</option><option>50</option><option>100</option>
+        </select>
+      </label>
+    </form>
+    <div style="margin-top:14px" id="events-body"><span class="empty">加载中…</span></div>
+    <div class="pager">
+      <button id="btn-prev" type="button">上一页</button>
+      <span id="page-info" class="mono muted"></span>
+      <button id="btn-next" type="button">下一页</button>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let currentPage = 1;
+let totalPages = 0;
+let autoTimer = null;
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+}
+
+function toast(message, isErr) {
+  const el = $("toast");
+  el.textContent = message;
+  el.className = "show" + (isErr ? " err" : "");
+  setTimeout(() => { el.className = ""; }, 4000);
+}
+
+function pct(offset, size) {
+  if (!size) return 100;
+  return Math.min(100, Math.round((offset / size) * 100));
+}
+
+async function loadStatus() {
+  const resp = await fetch("/api/deny/status");
+  const data = await resp.json();
+  const rows = data.files.map((f) => {
+    const state = f.hasError
+      ? '<span class="badge err">坏行停止</span>'
+      : (f.offsetBytes >= f.fileSize && f.offsetBytes > 0)
+        ? '<span class="badge ok">已采完</span>'
+        : (f.offsetBytes === 0 && f.lineCount === 0)
+          ? '<span class="badge wait">未采集</span>'
+          : '<span class="badge wait">增量待采</span>';
+    return `<tr>
+      <td><code>${escapeHtml(f.fileName)}</code></td>
+      <td class="mono muted">dev=${f.fileDev}<br>ino=${f.fileIno}</td>
+      <td class="mono">${f.fileSize}</td>
+      <td class="mono">${f.offsetBytes}</td>
+      <td class="mono">${f.lineCount}</td>
+      <td style="min-width:160px"><div class="progress-bar"><span style="width:${pct(f.offsetBytes, f.fileSize)}%"></span></div>
+        <span class="muted mono" style="font-size:11.5px">${pct(f.offsetBytes, f.fileSize)}%</span></td>
+      <td>${state}</td>
+      <td class="muted mono" style="font-size:11.5px">${escapeHtml(f.updatedAt ?? "—")}</td>
+    </tr>`;
+  }).join("");
+
+  const stale = data.staleProgress.length
+    ? `<h3 style="font-size:13px;margin:14px 0 6px;color:var(--muted)">已不在目录中的历史文件身份（进度保留）</h3>
+       <table><thead><tr><th>文件</th><th>身份</th><th>字节偏移</th><th>行数</th><th>更新时间</th></tr></thead>
+       <tbody>${data.staleProgress.map((f) => `<tr>
+         <td><code>${escapeHtml(f.fileName)}</code></td>
+         <td class="mono muted">dev=${f.fileDev}<br>ino=${f.fileIno}</td>
+         <td class="mono">${f.offsetBytes}</td><td class="mono">${f.lineCount}</td>
+         <td class="muted mono" style="font-size:11.5px">${escapeHtml(f.updatedAt)}</td></tr>`).join("")}</tbody></table>`
+    : "";
+
+  $("status-body").innerHTML = `
+    <p class="muted" style="margin:0 0 10px;font-size:12.5px">
+      日志目录 <code>${escapeHtml(data.logDir)}</code>
+      （${data.logDirExists ? "存在" : "不存在"}） · 数据库 <code>${escapeHtml(data.dbPath)}</code><br>
+      已入库被拒连接 <b style="color:var(--accent)">${data.totalEvents}</b> 条 ·
+      坏行文件 <b style="color:#f87171">${data.totalErrors}</b> 个
+    </p>
+    <table>
+      <thead><tr><th>文件</th><th>文件身份</th><th>大小(B)</th><th>已采偏移(B)</th><th>已入库行</th><th>进度</th><th>状态</th><th>最近提交</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty">目录中暂无 deny.log / deny.log.N 文件</td></tr>'}</tbody>
+    </table>${stale}`;
+
+  const panel = $("errors-panel");
+  if (data.errors.length) {
+    panel.classList.add("show");
+    $("errors-body").innerHTML = `<table>
+      <thead><tr><th>文件</th><th>行号</th><th>字节偏移</th><th>原因</th><th>原始内容预览</th><th>记录时间</th></tr></thead>
+      <tbody>${data.errors.map((e) => `<tr>
+        <td><code>${escapeHtml(e.fileName)}</code></td>
+        <td class="mono">${e.lineNo ?? "—"}</td>
+        <td class="mono">${e.lineOffset}</td>
+        <td style="color:#fca5a5">${escapeHtml(e.reason)}</td>
+        <td class="mono" style="max-width:320px;word-break:break-all">${escapeHtml(e.rawPreview) || "—"}</td>
+        <td class="muted mono" style="font-size:11.5px">${escapeHtml(e.createdAt)}</td>
+      </tr>`).join("")}</tbody></table>`;
+  } else {
+    panel.classList.remove("show");
+  }
+}
+
+function filterParams() {
+  const fd = new FormData($("filter-form"));
+  const params = new URLSearchParams();
+  for (const [k, v] of fd.entries()) {
+    if (v) params.set(k, v);
+  }
+  return params;
+}
+
+async function loadEvents(page) {
+  currentPage = page || 1;
+  const params = filterParams();
+  params.set("page", String(currentPage));
+  if (!params.has("page_size")) params.set("page_size", $("page-size").value);
+  const resp = await fetch("/api/deny/events?" + params.toString());
+  const data = await resp.json();
+  totalPages = data.totalPages;
+  if (currentPage > totalPages && totalPages > 0) { loadEvents(totalPages); return; }
+
+  $("events-body").innerHTML = data.items.length ? `<table>
+    <thead><tr><th>#</th><th>时间 (UTC)</th><th>源 IPv4</th><th>目的</th><th>端口</th><th>命中规则</th><th>来源位置（文件 : 行 / 字节偏移）</th></tr></thead>
+    <tbody>${data.items.map((it) => `<tr>
+      <td class="mono muted">${it.id}</td>
+      <td class="mono">${escapeHtml(it.tsIso)}</td>
+      <td><code>${escapeHtml(it.srcIp)}</code></td>
+      <td><code>${escapeHtml(it.dstIp)}</code></td>
+      <td class="mono">${it.dstPort}</td>
+      <td><span class="badge err">${escapeHtml(it.ruleId)}</span></td>
+      <td class="mono" style="font-size:12px">
+        <code>${escapeHtml(it.source.file)}</code> : 第 ${it.source.lineNo} 行
+        <span class="muted">（偏移 ${it.source.lineOffset} B · ino ${it.source.fileIno}）</span>
+      </td>
+    </tr>`).join("")}</tbody></table>`
+    : '<div class="empty">暂无记录。点击「立即采集」从 deny.log 入库被拒连接。</div>';
+
+  $("page-info").textContent = `第 ${data.page} / ${totalPages || 1} 页 · 共 ${data.total} 条`;
+  $("btn-prev").disabled = data.page <= 1;
+  $("btn-next").disabled = data.page >= totalPages;
+}
+
+async function collect() {
+  const btn = $("btn-collect");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/deny/collect", { method: "POST" });
+    const data = await resp.json();
+    if (resp.status === 409) { toast(data.message || "已有采集任务在执行", true); }
+    else if (data.stoppedOnBadLine) {
+      const f = data.files.find((x) => x.status === "bad-line");
+      toast(`采集在文件 ${f.file_name} 字节 ${f.line_offset} 处遇到坏行并停止，此前记录已保留`, true);
+    } else {
+      toast(`采集完成：本轮新入库 ${data.eventsInserted} 条`);
+    }
+    await Promise.all([loadStatus(), loadEvents(currentPage)]);
+  } catch (err) {
+    toast(`请求失败：${err}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function clearErrors() {
+  const resp = await fetch("/api/deny/errors/clear", { method: "POST" });
+  const data = await resp.json();
+  toast(`已清除 ${data.cleared} 条坏行标记，可重新采集`);
+  await Promise.all([loadStatus(), loadEvents(currentPage)]);
+}
+
+$("btn-collect").addEventListener("click", collect);
+$("btn-refresh").addEventListener("click", () => { loadStatus(); loadEvents(currentPage); });
+$("btn-clear-errors").addEventListener("click", clearErrors);
+$("btn-prev").addEventListener("click", () => loadEvents(currentPage - 1));
+$("btn-next").addEventListener("click", () => loadEvents(currentPage + 1));
+$("page-size").addEventListener("change", () => loadEvents(1));
+$("filter-form").addEventListener("submit", (e) => { e.preventDefault(); loadEvents(1); });
+$("btn-reset").addEventListener("click", () => {
+  $("filter-form").reset(); loadEvents(1);
+});
+$("auto-refresh").addEventListener("change", (e) => {
+  if (e.target.checked) {
+    autoTimer = setInterval(() => { loadStatus(); loadEvents(currentPage); }, 5000);
+  } else {
+    clearInterval(autoTimer);
+  }
+});
+
+loadStatus();
+loadEvents(1);
+</script>
+</body>
+</html>

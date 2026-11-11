@@ -1,8 +1,15 @@
 services:
-  firewall-rule-diff:
+  # Web 进程 A：浏览器演示入口
+  firewall-deny-web-a:
     build: .
-    image: firewall-rule-diff:1.0.0
-    container_name: firewall-rule-diff
+    image: firewall-deny:2.0.0
+    container_name: firewall-deny-web-a
+    environment:
+      DENY_LOG_DIR: /var/lib/firewall-deny/logs
+      DENY_DB_PATH: /var/lib/firewall-deny/data/deny.db
+      DENY_LOCK_PATH: /var/lib/firewall-deny/data/collector.lock
+    volumes:
+      - firewall-deny-data:/var/lib/firewall-deny
     ports:
       # 默认仅绑定宿主机回环地址；如需对局域网开放，改为 "8000:8000"
       - "127.0.0.1:8000:8000"
@@ -13,3 +20,45 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # Web 进程 B：第二个独立 uvicorn 进程，与 A 共享同一日志目录与 SQLite，
+  # 用于验证两进程并发触发采集时文件锁互斥（第二个返回 409，不漏不重）
+  firewall-deny-web-b:
+    image: firewall-deny:2.0.0
+    container_name: firewall-deny-web-b
+    depends_on:
+      - firewall-deny-web-a
+    environment:
+      DENY_LOG_DIR: /var/lib/firewall-deny/logs
+      DENY_DB_PATH: /var/lib/firewall-deny/data/deny.db
+      DENY_LOCK_PATH: /var/lib/firewall-deny/data/collector.lock
+    volumes:
+      - firewall-deny-data:/var/lib/firewall-deny
+    ports:
+      - "127.0.0.1:8001:8000"
+    restart: unless-stopped
+
+  # 本地日志源：分段写行、周期改名轮转、轮转后向旧文件续写
+  firewall-deny-log-source:
+    image: firewall-deny:2.0.0
+    container_name: firewall-deny-log-source
+    depends_on:
+      - firewall-deny-web-a
+    command:
+      - python
+      - tools/log_source.py
+      - daemon
+      - --interval
+      - "2"
+      - --rotate-after
+      - "12"
+      - --old-append-cycles
+      - "2"
+    environment:
+      DENY_LOG_DIR: /var/lib/firewall-deny/logs
+    volumes:
+      - firewall-deny-data:/var/lib/firewall-deny
+    restart: unless-stopped
+
+volumes:
+  firewall-deny-data:

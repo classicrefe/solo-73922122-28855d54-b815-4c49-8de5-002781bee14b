@@ -4,3 +4,11 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .DS_Store
+
+# 本地运行时的固定数据目录（日志、SQLite、锁文件）
+/var-lib/
+*.db
+*.db-wal
+*.db-shm
+collector.lock
+.log_source_state.json
